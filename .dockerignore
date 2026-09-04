@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+coverage
+playwright-report
+test-results
+storage
+public/wasm
+docs
+*.md
+!README.md

@@ -1,0 +1,302 @@
+// Atrium Studio database schema.
+//
+// Design notes:
+//  * The project model itself is stored as JSONB in `Project.model`. It is a
+//    single versioned document with its own migration chain (see
+//    src/domain/project/migrations.ts), and splitting it into relational tables
+//    would buy nothing — nothing queries inside a design, and a partial write is
+//    exactly the failure mode the transaction engine exists to prevent.
+//  * Every row that belongs to a user carries `ownerId` so authorisation is a
+//    single indexed predicate rather than a join walk.
+//  * Deletes cascade from the owner outwards so account deletion is complete.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String?
+  role         UserRole @default(USER)
+  /// Guest accounts are real, isolated accounts with a short lifetime. They are
+  /// never a bypass of ownership checks — every query is scoped identically.
+  isGuest      Boolean  @default(false)
+  guestExpires DateTime?
+  /// Display units and architectural preferences (see src/server/preferences.ts).
+  settings     Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions      Session[]
+  projects      Project[]
+  documents     KnowledgeDocument[]
+  assets        Asset[]
+  feedback      OperationFeedback[]
+
+  @@index([isGuest, guestExpires])
+}
+
+model Session {
+  /// SHA-256 of the session token. The raw token only ever exists in the cookie.
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  userAgent String?
+  ipHash    String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  ownerId     String
+  name        String
+  description String    @default("")
+  /// The serialized ProjectModel document.
+  model       Json
+  /// Denormalised for the dashboard so listing never deserialises every model.
+  elementCount Int      @default(0)
+  schemaVersion Int     @default(1)
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner         User                @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  versions      ProjectVersion[]
+  conversations Conversation[]
+  operations    Operation[]
+  assets        Asset[]
+  documents     KnowledgeDocument[]
+
+  @@index([ownerId, updatedAt(sort: Desc)])
+  @@index([ownerId, archivedAt])
+}
+
+enum VersionKind {
+  AUTOSAVE
+  MANUAL
+  SNAPSHOT
+  IMPORT
+  RESTORE_POINT
+}
+
+model ProjectVersion {
+  id        String      @id @default(cuid())
+  projectId String
+  label     String
+  kind      VersionKind @default(AUTOSAVE)
+  model     Json
+  revision  Int         @default(0)
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt(sort: Desc)])
+  @@index([projectId, kind])
+}
+
+model Conversation {
+  id        String   @id @default(cuid())
+  projectId String
+  title     String   @default("Design conversation")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project  Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([projectId, createdAt])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String      @db.Text
+  /// Operation plan, clarification questions, citations and token accounting.
+  metadata       Json        @default("{}")
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  operations   Operation[]
+
+  @@index([conversationId, createdAt])
+}
+
+enum OperationStatus {
+  APPLIED
+  ROLLED_BACK
+  REJECTED
+  CLARIFICATION
+}
+
+/// One AI or user transaction: the request, what it generated, and what happened.
+/// This is also the reviewable record that could later seed a fine-tuning set —
+/// nothing here is used for training automatically.
+model Operation {
+  id            String          @id @default(cuid())
+  projectId     String
+  messageId     String?
+  transactionId String
+  status        OperationStatus
+  /// The user's request, verbatim.
+  request       String          @db.Text
+  /// Summary of the project state the model was given (never the whole model).
+  sceneSummary  Json
+  /// The validated commands as executed.
+  commands      Json
+  /// Inverse commands, so a version restore can explain what it is undoing.
+  inverse       Json
+  issues        Json            @default("[]")
+  findings      Json            @default("[]")
+  summary       String          @default("")
+  provider      String          @default("mock")
+  model         String          @default("")
+  inputTokens   Int             @default(0)
+  outputTokens  Int             @default(0)
+  durationMs    Int             @default(0)
+  createdAt     DateTime        @default(now())
+
+  project  Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  message  Message?            @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  feedback OperationFeedback[]
+
+  @@index([projectId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+model OperationFeedback {
+  id          String   @id @default(cuid())
+  operationId String
+  userId      String
+  /// +1 or -1.
+  rating      Int
+  reason      String   @default("")
+  createdAt   DateTime @default(now())
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([operationId, userId])
+  @@index([rating])
+}
+
+enum DocumentScope {
+  /// Shipped reference material available to every project.
+  LIBRARY
+  /// Uploaded by a user, available across their own projects.
+  USER
+  /// Attached to one project only.
+  PROJECT
+}
+
+enum DocumentStatus {
+  PENDING
+  INDEXED
+  FAILED
+}
+
+model KnowledgeDocument {
+  id          String         @id @default(cuid())
+  ownerId     String?
+  projectId   String?
+  scope       DocumentScope  @default(USER)
+  status      DocumentStatus @default(PENDING)
+  title       String
+  /// Where the content came from: a filename, a URL, or a citation string.
+  source      String         @default("")
+  licence     String         @default("")
+  mimeType    String         @default("text/plain")
+  sizeBytes   Int            @default(0)
+  storageKey  String?
+  error       String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  owner   User?              @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  project Project?           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  chunks  KnowledgeChunk[]
+
+  @@index([ownerId, scope])
+  @@index([projectId])
+  @@index([scope, status])
+}
+
+model KnowledgeChunk {
+  id         String   @id @default(cuid())
+  documentId String
+  ordinal    Int
+  content    String   @db.Text
+  /// Dense vector stored as a JSON array. pgvector is not assumed to be
+  /// available; see docs/architecture.md for the upgrade path.
+  embedding  Json
+  /// Sparse term frequencies used by the lexical half of hybrid retrieval.
+  terms      Json     @default("{}")
+  tokens     Int      @default(0)
+  headings   String   @default("")
+
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, ordinal])
+  @@index([documentId])
+}
+
+enum AssetKind {
+  IMPORT_SOURCE
+  TEXTURE
+  THUMBNAIL
+  EXPORT
+  DOCUMENT
+}
+
+model Asset {
+  id         String    @id @default(cuid())
+  ownerId    String
+  projectId  String?
+  kind       AssetKind @default(IMPORT_SOURCE)
+  /// Storage key. Generated server-side; never taken from the client filename.
+  key        String    @unique
+  filename   String
+  mimeType   String
+  sizeBytes  Int
+  checksum   String?
+  createdAt  DateTime  @default(now())
+
+  owner   User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, createdAt(sort: Desc)])
+  @@index([projectId])
+}
+
+/// Sliding-window rate limiting. Postgres-backed so limits hold across every
+/// server instance without adding Redis to the required infrastructure.
+model RateLimitHit {
+  id        String   @id @default(cuid())
+  bucket    String
+  createdAt DateTime @default(now())
+
+  @@index([bucket, createdAt])
+}
